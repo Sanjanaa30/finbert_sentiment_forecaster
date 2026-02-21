@@ -1,0 +1,9 @@
+transformers
+datasets
+torch
+pandas
+scikit-learn
+xgboost
+fastapi
+uvicorn
+pandas_datareader

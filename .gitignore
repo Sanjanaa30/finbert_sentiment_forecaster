@@ -1,0 +1,38 @@
+# Readme Personal Notes
+Transformer-Based Financial Sentiment Forecasting Service.md
+
+# Virtual environments
+venv/
+.venv/
+
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Environment variables / secrets
+.env
+
+# Data / large files
+data/
+datasets/
+*.parquet
+*.pkl
+
+# Logs
+*.log
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
