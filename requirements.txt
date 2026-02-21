@@ -7,3 +7,4 @@ xgboost
 fastapi
 uvicorn
 pandas_datareader
+huggingface_hub
