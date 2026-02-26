@@ -36,3 +36,9 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+models/
+artifacts/*.npy
+artifacts/temperature.json
+# keep metrics tracked
+!artifacts/walkforward_metrics.csv
