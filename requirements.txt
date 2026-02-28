@@ -7,3 +7,4 @@ xgboost
 fastapi
 uvicorn
 huggingface_hub
+prefect

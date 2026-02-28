@@ -1,0 +1,7 @@
+{
+  "horizon_days": 20,
+  "threshold_bps": 5.0,
+  "feature_set": "market_only",
+  "model": "logreg",
+  "avg_roc_auc": 0.582760715162031
+}
