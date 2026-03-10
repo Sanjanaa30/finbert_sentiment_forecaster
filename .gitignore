@@ -4,6 +4,7 @@ Transformer-Based Financial Sentiment Forecasting Service.md
 # Virtual environments
 venv/
 .venv/
+.env
 
 # Python cache / build
 __pycache__/
