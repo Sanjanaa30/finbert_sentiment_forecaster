@@ -8,3 +8,4 @@ fastapi
 uvicorn
 huggingface_hub
 prefect
+python-dotenv

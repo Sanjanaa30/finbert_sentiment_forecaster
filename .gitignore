@@ -43,3 +43,10 @@ artifacts/*.npy
 artifacts/temperature.json
 # keep metrics tracked
 !artifacts/walkforward_metrics.csv
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.env.local
+frontend/.vite/
