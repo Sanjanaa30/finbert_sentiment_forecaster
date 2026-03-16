@@ -36,21 +36,47 @@ async function fetchJson(path, options = {}) {
   return response.json();
 }
 
+function hasUsableLiveOverview(data) {
+  return (
+    data &&
+    typeof data.sentiment_index === "number" &&
+    !Number.isNaN(data.sentiment_index) &&
+    typeof data.headlines_analyzed === "number" &&
+    data.headlines_analyzed > 0 &&
+    data.feed_type
+  );
+}
+
 
 function moodClass(mood) {
-  if (mood === "Positive") return "positive";
-  if (mood === "Negative") return "negative";
+  if (mood === "Positive" || mood === "Slightly Positive" || mood === "Strongly Positive") return "positive";
+  if (mood === "Negative" || mood === "Slightly Negative" || mood === "Strongly Negative") return "negative";
   return "neutral";
 }
 
 
 function formatSentiment(value) {
   if (typeof value !== "number" || Number.isNaN(value)) return "--";
-  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}`;
+  return `${value >= 0 ? "+" : ""}${value.toFixed(3)}`;
 }
 
 
-function describeSentiment(score) {
+function defaultCalibration() {
+  return {
+    strong_negative_max: -0.25,
+    slight_negative_max: -0.05,
+    slight_positive_min: 0.05,
+    strong_positive_min: 0.25,
+    source: "default",
+  };
+}
+
+function formatThreshold(value) {
+  if (typeof value !== "number" || Number.isNaN(value)) return "--";
+  return `${value >= 0 ? "+" : ""}${value.toFixed(3)}`;
+}
+
+function describeSentiment(score, calibration = defaultCalibration()) {
   if (typeof score !== "number" || Number.isNaN(score)) {
     return {
       label: "Loading",
@@ -59,28 +85,28 @@ function describeSentiment(score) {
     };
   }
 
-  if (score > 0.25) {
+  if (score >= calibration.strong_positive_min) {
     return {
       label: "Strongly Positive",
       explanation: "News tone is clearly optimistic today.",
       toneClass: "positive",
     };
   }
-  if (score > 0.05) {
+  if (score >= calibration.slight_positive_min) {
     return {
       label: "Slightly Positive",
       explanation: "News tone is mildly optimistic today.",
       toneClass: "positive",
     };
   }
-  if (score >= -0.05) {
+  if (score > calibration.slight_negative_max) {
     return {
       label: "Neutral",
       explanation: "News tone is mixed or balanced today.",
       toneClass: "neutral",
     };
   }
-  if (score >= -0.25) {
+  if (score > calibration.strong_negative_max) {
     return {
       label: "Slightly Negative",
       explanation: "News tone is mildly negative today.",
@@ -92,6 +118,27 @@ function describeSentiment(score) {
     explanation: "News tone is clearly pessimistic today.",
     toneClass: "negative",
   };
+}
+
+
+function formatDateTime(value) {
+  if (!value) return "--";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+  return new Intl.DateTimeFormat("en-US", {
+    month: "short",
+    day: "2-digit",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+  }).format(date);
+}
+
+function windowLabel(windowKey) {
+  if (windowKey === "1d") return "Today so far";
+  if (windowKey === "7d") return "Previous 7 calendar days";
+  if (windowKey === "30d") return "Previous 30 calendar days";
+  return windowKey || "--";
 }
 
 
@@ -128,7 +175,9 @@ export default function App() {
         ]);
 
         if (!active) return;
-        const chosenOverview = liveOverviewData || historicalOverviewData;
+        const chosenOverview = hasUsableLiveOverview(liveOverviewData)
+          ? liveOverviewData
+          : historicalOverviewData;
         setOverview(chosenOverview);
         setFeedLabel(chosenOverview?.feed_type || "historical_phase4");
         setTrendRows(trendData.rows || []);
@@ -191,14 +240,30 @@ export default function App() {
     [volumeRows]
   );
 
-  const sentimentDescription = useMemo(
-    () => describeSentiment(overview?.sentiment_index),
+  const calibration = useMemo(
+    () => overview?.calibration || defaultCalibration(),
     [overview]
+  );
+
+  const sentimentDescription = useMemo(
+    () => describeSentiment(overview?.sentiment_index, calibration),
+    [overview, calibration]
   );
 
   const liveHeadlines = useMemo(() => {
     if (!Array.isArray(overview?.sample_headlines)) return [];
     return overview.sample_headlines.slice(0, 5);
+  }, [overview]);
+
+  const liveWindowBadge = useMemo(() => {
+    if (!overview) return null;
+    return {
+      label: windowLabel(overview.window),
+      start: formatDateTime(overview.window_start_local),
+      end: formatDateTime(overview.window_end_local),
+      coverage: overview.coverage || "--",
+      timezone: overview.timezone || "--",
+    };
   }, [overview]);
 
   function feedLabelText(feedType) {
@@ -230,11 +295,18 @@ export default function App() {
           </div>
           <div className="metric-explainer">{sentimentDescription.explanation}</div>
           <div className="metric-legend">
-            <span><strong>{"> 0.25"}</strong> Strongly Positive</span>
-            <span><strong>0.05 to 0.25</strong> Slightly Positive</span>
-            <span><strong>-0.05 to 0.05</strong> Neutral</span>
-            <span><strong>-0.25 to -0.05</strong> Slightly Negative</span>
-            <span><strong>{"< -0.25"}</strong> Strongly Negative</span>
+            <span><strong>{`>= ${formatThreshold(calibration.strong_positive_min)}`}</strong> Strongly Positive</span>
+            <span><strong>{`${formatThreshold(calibration.slight_positive_min)} to ${formatThreshold(calibration.strong_positive_min)}`}</strong> Slightly Positive</span>
+            <span><strong>{`${formatThreshold(calibration.slight_negative_max)} to ${formatThreshold(calibration.slight_positive_min)}`}</strong> Neutral</span>
+            <span><strong>{`${formatThreshold(calibration.strong_negative_max)} to ${formatThreshold(calibration.slight_negative_max)}`}</strong> Slightly Negative</span>
+            <span><strong>{`< ${formatThreshold(calibration.strong_negative_max)}`}</strong> Strongly Negative</span>
+          </div>
+          <div className="badge-row">
+            <span className="info-badge">Window: {liveWindowBadge?.label || "--"}</span>
+            <span className="info-badge">Coverage: {liveWindowBadge?.coverage || "--"}</span>
+          </div>
+          <div className="metric-foot">
+            {liveWindowBadge ? `${liveWindowBadge.start} to ${liveWindowBadge.end} (${liveWindowBadge.timezone})` : "--"}
           </div>
           <div className="metric-foot">
             Updated: {overview?.latest_update || "--"} | Feed: {feedLabelText(feedLabel)}
@@ -249,8 +321,15 @@ export default function App() {
               : "--"}
           </div>
           <div className="metric-subtitle">Articles Today</div>
+          <div className="badge-row">
+            <span className="info-badge">Window: {liveWindowBadge?.label || "--"}</span>
+            <span className="info-badge">Coverage: {liveWindowBadge?.coverage || "--"}</span>
+          </div>
           <div className="metric-foot">
-            Latest mood: {overview?.market_mood || "--"}
+            {liveWindowBadge ? `${liveWindowBadge.start} to ${liveWindowBadge.end} (${liveWindowBadge.timezone})` : "--"}
+          </div>
+          <div className="metric-foot">
+            Latest mood: {sentimentDescription.label}
           </div>
         </article>
 
@@ -410,11 +489,17 @@ export default function App() {
                   <div className="headline-rank">{index + 1}</div>
                   <div className="headline-body">
                     <div className="headline-title">{item.headline}</div>
+                    {item.was_translated && item.original_headline && item.original_headline !== item.headline ? (
+                      <div className="headline-translation">
+                        Original: {item.original_headline}
+                      </div>
+                    ) : null}
                     <div className="headline-meta">
-                      Source: {item.source || "rss"} | Label: {item.label} | Score:{" "}
+                      Source: {item.source || "gdelt"} | Label: {item.display_label || item.label} | Score:{" "}
                       {typeof item.score === "number"
-                        ? `${item.score >= 0 ? "+" : ""}${item.score.toFixed(2)}`
+                        ? `${item.score >= 0 ? "+" : ""}${item.score.toFixed(3)}`
                         : "--"}
+                      {item.relevance_terms?.length ? ` | Matched: ${item.relevance_terms.join(", ")}` : ""}
                     </div>
                   </div>
                 </div>
@@ -435,15 +520,21 @@ export default function App() {
           </div>
         ) : null}
         {liveComparison?.source_policy ? (
-          <div className="metric-foot">
-            Primary source: {liveComparison.source_policy.primary_source} | Fallback source: {String(liveComparison.source_policy.fallback_source)} | GDELT status: {liveComparison.source_policy.gdelt_status}
-          </div>
+          <>
+            <div className="badge-row">
+              <span className="info-badge">Coverage: {liveComparison?.live?.coverage || overview?.coverage || "--"}</span>
+              <span className="info-badge">Timezone: {liveComparison?.live?.timezone || overview?.timezone || "--"}</span>
+            </div>
+            <div className="metric-foot">
+              Primary source: {liveComparison.source_policy.primary_source} | Fallback source: {String(liveComparison.source_policy.fallback_source)} | GDELT status: {liveComparison.source_policy.gdelt_status}
+            </div>
+          </>
         ) : null}
         <div className="headline-summary-grid">
           {[
             { label: "Today Live", data: liveComparison?.live },
-            { label: "Recent 7D", data: liveComparison?.recent_7d },
-            { label: "Recent 30D", data: liveComparison?.recent_30d },
+            { label: "Previous 7D", data: liveComparison?.recent_7d },
+            { label: "Previous 30D", data: liveComparison?.recent_30d },
           ].map((item) => (
             <div key={item.label} className="headline-summary-card">
               <div className="headline-summary-label">{item.label}</div>
@@ -454,6 +545,9 @@ export default function App() {
               </div>
               <div className="headline-meta">
                 Mood: {item.data?.market_mood || "--"} | Headlines: {item.data?.headlines_analyzed ?? "--"}
+              </div>
+              <div className="headline-meta">
+                Window: {windowLabel(item.data?.window)} | {formatDateTime(item.data?.window_start_local)} to {formatDateTime(item.data?.window_end_local)}
               </div>
             </div>
           ))}

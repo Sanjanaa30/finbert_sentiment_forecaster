@@ -53,11 +53,15 @@ def _require_csv(path: Path, label: str) -> pd.DataFrame:
 
 
 def _market_mood(score: float) -> str:
-    if score > 0.02:
-        return "Positive"
-    if score < -0.02:
-        return "Negative"
-    return "Neutral"
+    if score > 0.25:
+        return "Strongly Positive"
+    if score > 0.05:
+        return "Slightly Positive"
+    if score >= -0.05:
+        return "Neutral"
+    if score >= -0.25:
+        return "Slightly Negative"
+    return "Strongly Negative"
 
 
 def _load_live_snapshot() -> dict:

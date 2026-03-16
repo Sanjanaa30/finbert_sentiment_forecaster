@@ -46,7 +46,8 @@ def main() -> None:
 
     print(f"[live] saved snapshot to {args.output}")
     print(
-        "[live] 1d summary -> "
+        "[live] selected live window -> "
+        f"window={snapshot.get('window')} "
         f"feed={snapshot.get('feed_type')} "
         f"sentiment={snapshot.get('sentiment_index')} "
         f"headlines={snapshot.get('headlines_analyzed')}"

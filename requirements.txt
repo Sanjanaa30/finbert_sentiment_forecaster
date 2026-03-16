@@ -9,3 +9,5 @@ uvicorn
 huggingface_hub
 prefect
 python-dotenv
+langdetect
+deep-translator

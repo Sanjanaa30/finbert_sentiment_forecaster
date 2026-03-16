@@ -187,6 +187,25 @@ body {
   color: rgba(255, 255, 255, 0.78);
 }
 
+.badge-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.info-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: rgba(45, 121, 220, 0.08);
+  border: 1px solid rgba(45, 121, 220, 0.16);
+  color: #34567f;
+  font-size: 0.88rem;
+  font-weight: 700;
+}
+
 .forecast-row {
   display: flex;
   align-items: center;
@@ -389,6 +408,11 @@ body {
   line-height: 1.45;
 }
 
+.headline-translation {
+  color: #7a8497;
+  font-size: 0.9rem;
+  font-style: italic;
+}
 .headline-meta {
   color: #667389;
   font-size: 0.92rem;
