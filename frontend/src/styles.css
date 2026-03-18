@@ -187,6 +187,64 @@ body {
   color: rgba(255, 255, 255, 0.78);
 }
 
+.metric-context {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  border-radius: 16px;
+  background: linear-gradient(180deg, rgba(240, 244, 251, 0.95), rgba(233, 239, 248, 0.95));
+  border: 1px solid rgba(83, 97, 121, 0.1);
+}
+
+.metric-context-title {
+  font-size: 0.92rem;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: #44536d;
+}
+
+.metric-context-copy {
+  color: #55647d;
+  font-size: 0.94rem;
+  line-height: 1.45;
+}
+
+.metric-mix-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.metric-mix-pill {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  font-size: 0.86rem;
+  font-weight: 800;
+  border: 1px solid rgba(83, 97, 121, 0.12);
+}
+
+.metric-mix-pill.positive {
+  background: rgba(54, 143, 67, 0.1);
+  border-color: rgba(54, 143, 67, 0.18);
+  color: #2f8f43;
+}
+
+.metric-mix-pill.neutral {
+  background: rgba(103, 111, 124, 0.1);
+  border-color: rgba(103, 111, 124, 0.18);
+  color: #596172;
+}
+
+.metric-mix-pill.negative {
+  background: rgba(196, 79, 47, 0.1);
+  border-color: rgba(196, 79, 47, 0.18);
+  color: #c44f2f;
+}
+
 .badge-row {
   display: flex;
   flex-wrap: wrap;
@@ -353,6 +411,116 @@ body {
   border-color: rgba(196, 79, 47, 0.18);
 }
 
+.headline-tab-row {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 14px;
+  margin-bottom: 18px;
+}
+
+.headline-tab {
+  border-radius: 16px;
+  padding: 14px 16px;
+  border: 1px solid rgba(83, 97, 121, 0.12);
+  background: rgba(255, 255, 255, 0.92);
+  cursor: pointer;
+  text-align: left;
+  transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+}
+
+.headline-tab-label {
+  display: block;
+  font-size: 0.92rem;
+  font-weight: 800;
+  color: #5a667d;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.headline-tab-count {
+  display: block;
+  margin-top: 8px;
+  font-size: 1.8rem;
+  font-weight: 900;
+  color: #1f2940;
+  line-height: 1;
+}
+
+.headline-group-title {
+  font-size: 1rem;
+  font-weight: 800;
+  color: #31415f;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  margin-bottom: 10px;
+}
+
+.headline-tab:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 8px 20px rgba(24, 36, 58, 0.08);
+}
+
+.headline-tab.active {
+  box-shadow: 0 12px 24px rgba(24, 36, 58, 0.1);
+}
+
+.headline-tab.positive,
+.headline-group.positive {
+  background: rgba(54, 143, 67, 0.08);
+  border-color: rgba(54, 143, 67, 0.18);
+}
+
+.headline-tab.neutral,
+.headline-group.neutral {
+  background: rgba(103, 111, 124, 0.08);
+  border-color: rgba(103, 111, 124, 0.18);
+}
+
+.headline-tab.negative,
+.headline-group.negative {
+  background: rgba(196, 79, 47, 0.08);
+  border-color: rgba(196, 79, 47, 0.18);
+}
+
+.headline-group {
+  border-radius: 18px;
+  border: 1px solid rgba(83, 97, 121, 0.12);
+  padding: 14px;
+  background: rgba(255, 255, 255, 0.9);
+}
+
+.headline-group.single {
+  margin-top: 4px;
+}
+
+.headline-group.positive {
+  background: rgba(54, 143, 67, 0.06);
+  border-color: rgba(54, 143, 67, 0.16);
+}
+
+.headline-group.neutral {
+  background: rgba(103, 111, 124, 0.06);
+  border-color: rgba(103, 111, 124, 0.16);
+}
+
+.headline-group.negative {
+  background: rgba(196, 79, 47, 0.06);
+  border-color: rgba(196, 79, 47, 0.16);
+}
+
+.headline-list.compact {
+  margin-top: 12px;
+}
+
+.headline-item.compact {
+  grid-template-columns: 40px 1fr;
+  padding: 12px 14px;
+}
+
+.headline-item.compact .headline-title {
+  font-size: 0.98rem;
+}
+
 .headline-summary-label {
   font-size: 0.9rem;
   font-weight: 800;
@@ -408,6 +576,15 @@ body {
   line-height: 1.45;
 }
 
+.headline-link {
+  text-decoration: none;
+}
+
+.headline-link:hover {
+  text-decoration: underline;
+  color: #225faf;
+}
+
 .headline-translation {
   color: #7a8497;
   font-size: 0.9rem;
@@ -426,6 +603,10 @@ body {
   }
 
   .headline-summary-grid {
+    grid-template-columns: 1fr;
+  }
+
+  .headline-tab-row {
     grid-template-columns: 1fr;
   }
 

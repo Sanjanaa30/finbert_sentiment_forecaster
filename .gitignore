@@ -1,6 +1,9 @@
 # Readme Personal Notes
 Transformer-Based Financial Sentiment Forecasting Service.md
 
+#Database
+sentiment.db
+
 # Virtual environments
 venv/
 .venv/

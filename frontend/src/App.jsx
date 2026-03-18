@@ -3,7 +3,6 @@ import {
   Area,
   AreaChart,
   Bar,
-  BarChart,
   CartesianGrid,
   Line,
   LineChart,
@@ -36,23 +35,6 @@ async function fetchJson(path, options = {}) {
   return response.json();
 }
 
-function hasUsableLiveOverview(data) {
-  return (
-    data &&
-    typeof data.sentiment_index === "number" &&
-    !Number.isNaN(data.sentiment_index) &&
-    typeof data.headlines_analyzed === "number" &&
-    data.headlines_analyzed > 0 &&
-    data.feed_type
-  );
-}
-
-
-function moodClass(mood) {
-  if (mood === "Positive" || mood === "Slightly Positive" || mood === "Strongly Positive") return "positive";
-  if (mood === "Negative" || mood === "Slightly Negative" || mood === "Strongly Negative") return "negative";
-  return "neutral";
-}
 
 
 function formatSentiment(value) {
@@ -155,19 +137,18 @@ export default function App() {
   const [headlineError, setHeadlineError] = useState("");
   const [loadingScore, setLoadingScore] = useState(false);
   const [error, setError] = useState("");
+  const [activeHeadlineTab, setActiveHeadlineTab] = useState("positive");
 
   useEffect(() => {
     let active = true;
 
     async function loadDashboard() {
       try {
-        const liveOverviewPromise = fetchJson("/dashboard/live-overview?max_headlines=40").catch(() => null);
-        const [liveOverviewData, historicalOverviewData, trendData, volumeData, summaryData, liveComparisonData] = await Promise.all([
-          liveOverviewPromise,
-          fetchJson("/dashboard/overview"),
-          fetchJson("/dashboard/sentiment-trend"),
-          fetchJson("/dashboard/headline-volume"),
-          fetchJson("/dashboard/model-summary"),
+        const [liveOverviewData, trendData, volumeData, summaryData, liveComparisonData] = await Promise.all([
+          fetchJson("/dashboard/live-overview?max_headlines=40").catch(() => null),
+          fetchJson("/dashboard/live-sentiment-trend").catch(() => ({ rows: [] })),
+          fetchJson("/dashboard/headline-volume").catch(() => ({ rows: [] })),
+          fetchJson("/dashboard/model-summary").catch(() => null),
           fetchJson("/dashboard/live-vs-history").catch((err) => {
             setLiveComparisonError(String(err.message || err));
             return null;
@@ -175,11 +156,8 @@ export default function App() {
         ]);
 
         if (!active) return;
-        const chosenOverview = hasUsableLiveOverview(liveOverviewData)
-          ? liveOverviewData
-          : historicalOverviewData;
-        setOverview(chosenOverview);
-        setFeedLabel(chosenOverview?.feed_type || "historical_phase4");
+        setOverview(liveOverviewData);
+        setFeedLabel(liveOverviewData?.feed_type || "live_sqlite");
         setTrendRows(trendData.rows || []);
         setVolumeRows(volumeData.rows || []);
         setModelSummary(summaryData);
@@ -250,10 +228,59 @@ export default function App() {
     [overview, calibration]
   );
 
-  const liveHeadlines = useMemo(() => {
-    if (!Array.isArray(overview?.sample_headlines)) return [];
-    return overview.sample_headlines.slice(0, 5);
+  const groupedLiveHeadlines = useMemo(() => {
+    return {
+      positive: Array.isArray(overview?.positive_headlines) ? overview.positive_headlines.slice(0, 5) : [],
+      neutral: Array.isArray(overview?.neutral_headlines) ? overview.neutral_headlines.slice(0, 5) : [],
+      negative: Array.isArray(overview?.negative_headlines) ? overview.negative_headlines.slice(0, 5) : [],
+    };
   }, [overview]);
+
+  const sentimentMix = useMemo(() => {
+    if (!overview) return null;
+    const total = typeof overview.headlines_analyzed === "number" ? overview.headlines_analyzed : 0;
+    const positive = typeof overview.positive_count === "number"
+      ? overview.positive_count
+      : Math.round((overview.positive_share || 0) * total);
+    const neutral = typeof overview.neutral_count === "number"
+      ? overview.neutral_count
+      : Math.round((overview.neutral_share || 0) * total);
+    const negative = typeof overview.negative_count === "number"
+      ? overview.negative_count
+      : Math.max(total - positive - neutral, 0);
+    return { positive, neutral, negative };
+  }, [overview]);
+
+  const headlineTabs = useMemo(() => {
+    return [
+      {
+        key: "positive",
+        label: "Positive",
+        count: sentimentMix?.positive ?? "--",
+        items: groupedLiveHeadlines.positive,
+        className: "positive",
+      },
+      {
+        key: "neutral",
+        label: "Neutral",
+        count: sentimentMix?.neutral ?? "--",
+        items: groupedLiveHeadlines.neutral,
+        className: "neutral",
+      },
+      {
+        key: "negative",
+        label: "Negative",
+        count: sentimentMix?.negative ?? "--",
+        items: groupedLiveHeadlines.negative,
+        className: "negative",
+      },
+    ];
+  }, [groupedLiveHeadlines, sentimentMix]);
+
+  const activeHeadlineGroup = useMemo(
+    () => headlineTabs.find((item) => item.key === activeHeadlineTab) || headlineTabs[0],
+    [headlineTabs, activeHeadlineTab]
+  );
 
   const liveWindowBadge = useMemo(() => {
     if (!overview) return null;
@@ -265,6 +292,49 @@ export default function App() {
       timezone: overview.timezone || "--",
     };
   }, [overview]);
+
+  const sentimentDriverCopy = useMemo(() => {
+    if (!overview || !sentimentMix) {
+      return {
+        summary: "Waiting for the latest headline mix.",
+        driver: "Once the live feed loads, this card will explain what is pushing the index up or down.",
+      };
+    }
+
+    const total = typeof overview.headlines_analyzed === "number" ? overview.headlines_analyzed : 0;
+    const largestBucket = [
+      { key: "positive", label: "positive", count: sentimentMix.positive || 0 },
+      { key: "neutral", label: "neutral", count: sentimentMix.neutral || 0 },
+      { key: "negative", label: "negative", count: sentimentMix.negative || 0 },
+    ].sort((a, b) => b.count - a.count)[0];
+
+    const summary =
+      total > 0
+        ? `Built from ${total} live headlines: ${sentimentMix.positive} positive, ${sentimentMix.neutral} neutral, ${sentimentMix.negative} negative.`
+        : "No live headlines were available for this window.";
+
+    let driver = "Open the Live Market Headlines tabs below to see the top examples in each sentiment group.";
+    if (total > 0) {
+      if (largestBucket.key === "neutral") {
+        driver =
+          "Neutral headlines are the largest group, so the index is being shaped mostly by how strong the positive and negative headlines are.";
+      } else if (largestBucket.key === "positive") {
+        driver =
+          "Positive headlines are the largest group, which is helping lift the sentiment index higher than neutral.";
+      } else if (largestBucket.key === "negative") {
+        driver =
+          "Negative headlines are the largest group, so they are putting the most downward pressure on the sentiment index.";
+      }
+
+      if (overview.top_positive_headline?.headline && sentimentDescription.toneClass === "positive") {
+        driver = `${driver} Strongest positive example: ${overview.top_positive_headline.headline}`;
+      } else if (overview.top_negative_headline?.headline && sentimentDescription.toneClass === "negative") {
+        driver = `${driver} Strongest negative example: ${overview.top_negative_headline.headline}`;
+      }
+    }
+
+    return { summary, driver, dominantLabel: largestBucket.label };
+  }, [overview, sentimentMix, sentimentDescription.toneClass]);
 
   function feedLabelText(feedType) {
     if (feedType === "live_gdelt") return "Live GDELT";
@@ -300,6 +370,16 @@ export default function App() {
             <span><strong>{`${formatThreshold(calibration.slight_negative_max)} to ${formatThreshold(calibration.slight_positive_min)}`}</strong> Neutral</span>
             <span><strong>{`${formatThreshold(calibration.strong_negative_max)} to ${formatThreshold(calibration.slight_negative_max)}`}</strong> Slightly Negative</span>
             <span><strong>{`< ${formatThreshold(calibration.strong_negative_max)}`}</strong> Strongly Negative</span>
+          </div>
+          <div className="metric-context">
+            <div className="metric-context-title">Why This Score</div>
+            <div className="metric-context-copy">{sentimentDriverCopy.summary}</div>
+            <div className="metric-mix-row">
+              <span className="metric-mix-pill positive">Positive {sentimentMix?.positive ?? "--"}</span>
+              <span className="metric-mix-pill neutral">Neutral {sentimentMix?.neutral ?? "--"}</span>
+              <span className="metric-mix-pill negative">Negative {sentimentMix?.negative ?? "--"}</span>
+            </div>
+            <div className="metric-context-copy">{sentimentDriverCopy.driver}</div>
           </div>
           <div className="badge-row">
             <span className="info-badge">Window: {liveWindowBadge?.label || "--"}</span>
@@ -483,27 +563,48 @@ export default function App() {
               </div>
             </div>
 
-            <div className="headline-list">
-              {liveHeadlines.map((item, index) => (
-                <div key={`${item.headline}-${index}`} className="headline-item">
-                  <div className="headline-rank">{index + 1}</div>
-                  <div className="headline-body">
-                    <div className="headline-title">{item.headline}</div>
-                    {item.was_translated && item.original_headline && item.original_headline !== item.headline ? (
-                      <div className="headline-translation">
-                        Original: {item.original_headline}
+            <div className="headline-tab-row">
+              {headlineTabs.map((group) => (
+                <button
+                  key={group.key}
+                  type="button"
+                  className={`headline-tab ${group.className} ${activeHeadlineTab === group.key ? "active" : ""}`}
+                  onClick={() => setActiveHeadlineTab(group.key)}
+                >
+                  <span className="headline-tab-label">{group.label}</span>
+                  <span className="headline-tab-count">{group.count}</span>
+                </button>
+              ))}
+            </div>
+
+            <div className={`headline-group single ${activeHeadlineGroup?.className || "positive"}`}>
+              <div className="headline-group-title">
+                {activeHeadlineGroup ? `${activeHeadlineGroup.label} (${activeHeadlineGroup.count})` : "Headlines"}
+              </div>
+              <div className="headline-list compact">
+                {activeHeadlineGroup?.items?.length ? activeHeadlineGroup.items.map((item, index) => (
+                  <div key={`${activeHeadlineGroup.key}-${item.headline}-${index}`} className="headline-item compact">
+                    <div className="headline-rank">{index + 1}</div>
+                    <div className="headline-body">
+                      <a className="headline-title headline-link" href={item.link || "#"} target="_blank" rel="noreferrer">{item.headline}</a>
+                      {item.was_translated && item.original_headline && item.original_headline !== item.headline ? (
+                        <div className="headline-translation">
+                          Original: {item.original_headline}
+                        </div>
+                      ) : null}
+                      <div className="headline-meta">
+                        Source: {item.source || "gdelt"} | Label: {item.display_label || item.label} | Score:{" "}
+                        {typeof item.score === "number"
+                          ? `${item.score >= 0 ? "+" : ""}${item.score.toFixed(3)}`
+                          : "--"}
+                        {item.relevance_terms?.length ? ` | Matched: ${Array.isArray(item.relevance_terms) ? item.relevance_terms.join(", ") : item.relevance_terms}` : ""}
                       </div>
-                    ) : null}
-                    <div className="headline-meta">
-                      Source: {item.source || "gdelt"} | Label: {item.display_label || item.label} | Score:{" "}
-                      {typeof item.score === "number"
-                        ? `${item.score >= 0 ? "+" : ""}${item.score.toFixed(3)}`
-                        : "--"}
-                      {item.relevance_terms?.length ? ` | Matched: ${item.relevance_terms.join(", ")}` : ""}
                     </div>
                   </div>
-                </div>
-              ))}
+                )) : (
+                  <div className="metric-foot">No headlines in this sentiment group.</div>
+                )}
+              </div>
             </div>
           </>
         )}
@@ -523,7 +624,7 @@ export default function App() {
           <>
             <div className="badge-row">
               <span className="info-badge">Coverage: {liveComparison?.live?.coverage || overview?.coverage || "--"}</span>
-              <span className="info-badge">Timezone: {liveComparison?.live?.timezone || overview?.timezone || "--"}</span>
+              <span className="info-badge">Timezone: America/New_York (ET)</span>
             </div>
             <div className="metric-foot">
               Primary source: {liveComparison.source_policy.primary_source} | Fallback source: {String(liveComparison.source_policy.fallback_source)} | GDELT status: {liveComparison.source_policy.gdelt_status}
@@ -548,6 +649,9 @@ export default function App() {
               </div>
               <div className="headline-meta">
                 Window: {windowLabel(item.data?.window)} | {formatDateTime(item.data?.window_start_local)} to {formatDateTime(item.data?.window_end_local)}
+              </div>
+              <div className="headline-meta">
+                Source: {item.data?.window_source_label || item.data?.source || item.data?.feed_type || "--"}
               </div>
             </div>
           ))}

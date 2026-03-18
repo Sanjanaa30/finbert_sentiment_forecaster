@@ -1,12 +1,15 @@
-from datetime import datetime, timezone
+from datetime import datetime, date, timedelta, timezone
 from pathlib import Path
 import json
+import threading
 
 import pandas as pd
 from fastapi import Depends, FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import torch
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
 from time import perf_counter
 from fastapi import Request
@@ -21,14 +24,20 @@ from app.schemas import (
     ForecastResponse,
 )
 from app.security import verify_api_key
-from src.live_news import build_live_snapshot
+from src.live_news import run_pipeline, get_historical_window_summary, _today_window
+from src.database import (
+    init_db,
+    fetch_scored_for_window,
+    fetch_daily_sentiment_range,
+    fetch_today_top_headlines,
+    _market_mood,
+)
+from zoneinfo import ZoneInfo
 
 ROOT = Path(__file__).resolve().parents[1]
-SENT_PATH = ROOT / "data" / "processed" / "daily_sentiment_index.csv"
-SPY_PATH = ROOT / "data" / "processed" / "spy_stooq.csv"
 METRICS_PATH = ROOT / "artifacts" / "walkforward_metrics.csv"
 MODEL_DIR = ROOT / "models" / "finbert_sentiment"
-LIVE_SNAPSHOT_PATH = ROOT / "artifacts" / "live_sentiment_snapshot.json"
+LOCAL_TZ = ZoneInfo("America/New_York")
 
 app = FastAPI(title="FinBERT Forecast API")
 app.add_middleware(
@@ -41,53 +50,218 @@ app.add_middleware(
 
 _tokenizer = None
 _sent_model = None
+_scheduler: BackgroundScheduler | None = None
 
 
-def _require_csv(path: Path, label: str) -> pd.DataFrame:
-    if not path.exists():
-        raise HTTPException(status_code=404, detail=f"{label} not found")
-    df = pd.read_csv(path)
-    if df.empty:
-        raise HTTPException(status_code=404, detail=f"{label} is empty")
-    return df
-
-
-def _market_mood(score: float) -> str:
-    if score > 0.25:
-        return "Strongly Positive"
-    if score > 0.05:
-        return "Slightly Positive"
-    if score >= -0.05:
-        return "Neutral"
-    if score >= -0.25:
-        return "Slightly Negative"
-    return "Strongly Negative"
-
-
-def _load_live_snapshot() -> dict:
-    if not LIVE_SNAPSHOT_PATH.exists():
-        raise HTTPException(
-            status_code=404,
-            detail="live_sentiment_snapshot.json not found. Run the live snapshot builder first.",
+def _run_pipeline_job() -> None:
+    """Background job: run the full news pipeline and log results."""
+    try:
+        print(f"[scheduler] Starting pipeline run at {datetime.now(LOCAL_TZ).strftime('%Y-%m-%d %H:%M %Z')}")
+        result = run_pipeline(
+            tokenizer=_tokenizer,
+            model=_sent_model,
+            model_version=get_bundle().model_version,
         )
-    return json.loads(LIVE_SNAPSHOT_PATH.read_text(encoding="utf-8"))
+        si = result.get("sentiment_index")
+        mood = result.get("market_mood")
+        count = result.get("headlines_analyzed")
+        sources = result.get("sources_used", [])
+        errors = result.get("source_errors", [])
+        print(
+            f"[scheduler] Done — sentiment: {f'{si:.3f}' if si is not None else 'N/A'}, "
+            f"mood: {mood}, headlines: {count}, sources: {sources}"
+        )
+        if errors:
+            print(f"[scheduler] Source errors: {errors}")
+    except Exception as exc:
+        print(f"[scheduler] Pipeline error: {exc}")
 
 
 @app.on_event("startup")
 def startup() -> None:
-    global _tokenizer, _sent_model
-    load_bundle()  # loads final_model.pkl + final_selected_config.json
+    global _tokenizer, _sent_model, _scheduler
+    init_db()
+    load_bundle()
     _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
     _sent_model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR).eval()
+
+    # Run pipeline immediately on startup (in background so server starts fast)
+    threading.Thread(target=_run_pipeline_job, daemon=True).start()
+
+    # Schedule pipeline at 9AM, 12PM, 3PM, 6PM ET, Mon–Fri
+    _scheduler = BackgroundScheduler(timezone="America/New_York")
+    _scheduler.add_job(
+        _run_pipeline_job,
+        CronTrigger(hour="9,12,15,18", day_of_week="mon-fri", timezone="America/New_York"),
+        id="live_pipeline",
+        replace_existing=True,
+    )
+    _scheduler.start()
+    print("[scheduler] Scheduled pipeline at 9AM, 12PM, 3PM, 6PM ET (Mon–Fri)")
+
+
+@app.on_event("shutdown")
+def shutdown() -> None:
+    if _scheduler and _scheduler.running:
+        _scheduler.shutdown(wait=False)
+        print("[scheduler] Scheduler stopped.")
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _window_bounds(days: int) -> tuple[datetime, datetime]:
+    now_local = datetime.now(LOCAL_TZ)
+    start_local = datetime.combine(
+        (now_local - timedelta(days=days - 1)).date(),
+        datetime.min.time(),
+        tzinfo=LOCAL_TZ,
+    )
+    return start_local.astimezone(timezone.utc), now_local.astimezone(timezone.utc)
+
+
+def _summarize_rows(rows: list[dict], window: str) -> dict:
+    if not rows:
+        return {
+            "window": window, "sentiment_index": None,
+            "market_mood": "Unavailable", "headlines_analyzed": 0,
+            "positive_count": 0, "neutral_count": 0, "negative_count": 0,
+            "positive_share": None, "neutral_share": None, "negative_share": None,
+            "top_positive_headline": None, "top_negative_headline": None,
+            "positive_headlines": [], "neutral_headlines": [], "negative_headlines": [],
+        }
+    scores = [r["score"] for r in rows]
+    labels = [r["label"] for r in rows]
+    total = len(rows)
+    pos = labels.count("positive")
+    neu = labels.count("neutral")
+    neg = labels.count("negative")
+    si = sum(scores) / total
+    sorted_pos = sorted(rows, key=lambda r: r["score"], reverse=True)
+    sorted_neg = sorted(rows, key=lambda r: r["score"])
+    return {
+        "window": window,
+        "sentiment_index": si,
+        "market_mood": _market_mood(si),
+        "headlines_analyzed": total,
+        "positive_count": pos, "neutral_count": neu, "negative_count": neg,
+        "positive_share": pos / total,
+        "neutral_share": neu / total,
+        "negative_share": neg / total,
+        "top_positive_headline": sorted_pos[0]["headline"] if sorted_pos else None,
+        "top_negative_headline": sorted_neg[0]["headline"] if sorted_neg else None,
+        "positive_headlines": sorted_pos[:5],
+        "neutral_headlines": sorted([r for r in rows if r["label"] == "neutral"], key=lambda r: r["abs_score"])[:5],
+        "negative_headlines": sorted_neg[:5],
+        "sample_headlines": sorted(rows, key=lambda r: r["abs_score"], reverse=True)[:10],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Health
+# ---------------------------------------------------------------------------
 
 @app.get("/health", dependencies=[Depends(verify_api_key)])
 def health():
     b = get_bundle()
+    return {"status": "ok", "model_loaded": True, "model_version": b.model_version}
+
+
+# ---------------------------------------------------------------------------
+# Live overview — today's sentiment from SQLite
+# ---------------------------------------------------------------------------
+
+@app.get("/dashboard/live-overview", dependencies=[Depends(verify_api_key)])
+def dashboard_live_overview():
+    start_utc, end_utc = _window_bounds(1)
+    rows = fetch_scored_for_window(start_utc, end_utc)
+    summary = _summarize_rows(rows, "1d")
+    top = fetch_today_top_headlines()
+    summary["positive_headlines"] = top["positive"]
+    summary["neutral_headlines"] = top["neutral"]
+    summary["negative_headlines"] = top["negative"]
+    summary["latest_update"] = date.today().isoformat()
+    summary["feed_type"] = "live_sqlite"
+    summary["coverage"] = "Global market news"
+    return summary
+
+
+# ---------------------------------------------------------------------------
+# Live vs history — 1d / 7d / 30d from SQLite
+# ---------------------------------------------------------------------------
+
+@app.get("/dashboard/live-vs-history", dependencies=[Depends(verify_api_key)])
+def dashboard_live_vs_history():
+    # 1D: today midnight → now
+    start_1d, end_1d = _today_window()
+    rows_1d = fetch_scored_for_window(start_1d, end_1d)
+    live = _summarize_rows(rows_1d, "1d")
+    live["window_start_local"] = start_1d.astimezone(LOCAL_TZ).isoformat()
+    live["window_end_local"] = end_1d.astimezone(LOCAL_TZ).isoformat()
+    live["window_source_label"] = "Live (today)"
+
+    # 7D/30D: hybrid — stable, excludes today
+    recent_7d = get_historical_window_summary(7, _tokenizer, _sent_model, "7d")
+    recent_30d = get_historical_window_summary(30, _tokenizer, _sent_model, "30d")
+
     return {
-        "status": "ok",
-        "model_loaded": True,
-        "model_version": b.model_version,
+        "live": live,
+        "recent_7d": recent_7d,
+        "recent_30d": recent_30d,
+        "source_policy": {
+            "primary_source": "Yahoo Finance RSS + Alpha Vantage + GDELT",
+            "gdelt_status": "supplementary",
+        },
+        "timestamp": datetime.now(timezone.utc),
     }
+
+
+# ---------------------------------------------------------------------------
+# Live sentiment trend — daily aggregates from SQLite
+# ---------------------------------------------------------------------------
+
+@app.get("/dashboard/live-sentiment-trend", dependencies=[Depends(verify_api_key)])
+def dashboard_live_sentiment_trend(days: int = 30):
+    end = date.today()
+    start = end - timedelta(days=days)
+    rows = fetch_daily_sentiment_range(start, end)
+    return {"rows": rows}
+
+
+# ---------------------------------------------------------------------------
+# Headline volume — daily counts from SQLite
+# ---------------------------------------------------------------------------
+
+@app.get("/dashboard/headline-volume", dependencies=[Depends(verify_api_key)])
+def dashboard_headline_volume(days: int = 60):
+    end = date.today()
+    start = end - timedelta(days=days)
+    rows = fetch_daily_sentiment_range(start, end)
+    return {
+        "rows": [{"date": r["date"], "headline_volume": r["headline_volume"]} for r in rows]
+    }
+
+
+# ---------------------------------------------------------------------------
+# Live refresh — re-run full pipeline
+# ---------------------------------------------------------------------------
+
+@app.post("/dashboard/live-refresh", dependencies=[Depends(verify_api_key)])
+def dashboard_live_refresh():
+    try:
+        return run_pipeline(
+            tokenizer=_tokenizer,
+            model=_sent_model,
+            model_version=get_bundle().model_version,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Pipeline failed: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
+# Score headline
+# ---------------------------------------------------------------------------
 
 @app.post(
     "/score_headline",
@@ -100,164 +274,38 @@ def score_headline(req: ScoreRequest):
     if not headlines:
         raise HTTPException(status_code=400, detail="headline list is empty")
 
-    enc = _tokenizer(headlines, truncation=True, padding=True, max_length=128, return_tensors="pt")
+    enc = _tokenizer(headlines, truncation=True, padding=True,
+                     max_length=128, return_tensors="pt")
     with torch.no_grad():
         probs = torch.softmax(_sent_model(**enc).logits, dim=-1).cpu().numpy()
 
-    # FinBERT label order is typically [negative, neutral, positive]
-    out = []
     labels = ["negative", "neutral", "positive"]
+    out = []
     for h, p in zip(headlines, probs):
         p_neg, p_neu, p_pos = float(p[0]), float(p[1]), float(p[2])
-        score = p_pos - p_neg
-        out.append(
-            ScoreItem(
-                headline=h,
-                label=labels[int(p.argmax())],
-                score=score,
-                probabilities={"negative": p_neg, "neutral": p_neu, "positive": p_pos},
-            )
-        )
+        out.append(ScoreItem(
+            headline=h,
+            label=labels[int(p.argmax())],
+            score=p_pos - p_neg,
+            probabilities={"negative": p_neg, "neutral": p_neu, "positive": p_pos},
+        ))
 
     ts = datetime.now(timezone.utc)
     model_version = get_bundle().model_version
-
     if single:
         return ScoreSingleResponse(result=out[0], timestamp=ts, model_version=model_version)
-
     return ScoreResponse(results=out, timestamp=ts, model_version=model_version)
 
-@app.get("/sentiment_index/latest", dependencies=[Depends(verify_api_key)])
-def sentiment_index_latest():
-    df = _require_csv(SENT_PATH, "daily_sentiment_index.csv")
-    row = df.iloc[-1].to_dict()
-    return {
-        "latest": row,
-        "timestamp": datetime.now(timezone.utc),
-        "model_version": get_bundle().model_version,
-    }
 
-@app.post("/forecast/next_day", response_model=ForecastResponse, dependencies=[Depends(verify_api_key)])
-def forecast_next_day(req: ForecastRequest):
-    b = get_bundle()
-    missing = [f for f in b.features if f not in req.features]
-    if missing:
-        raise HTTPException(status_code=400, detail=f"Missing features: {missing}")
-
-    x = pd.DataFrame([{f: req.features[f] for f in b.features}])
-    model = b.model  # pipeline or estimator from final_model.pkl
-
-    if hasattr(model, "predict_proba"):
-        p_up = float(model.predict_proba(x)[0, 1])
-    else:
-        # fallback
-        pred = int(model.predict(x)[0])
-        p_up = 1.0 if pred == 1 else 0.0
-
-    p_down = 1.0 - p_up
-    pred_label = "up" if p_up >= 0.5 else "down"
-
-    return ForecastResponse(
-        forecast_class=pred_label,
-        probabilities={"down": p_down, "up": p_up},
-        timestamp=datetime.now(timezone.utc),
-        model_version=b.model_version,
-    )
-
-
-@app.get("/dashboard/overview", dependencies=[Depends(verify_api_key)])
-def dashboard_overview():
-    sentiment_df = _require_csv(SENT_PATH, "daily_sentiment_index.csv")
-    latest = sentiment_df.iloc[-1].to_dict()
-    score = float(latest.get("mean_sentiment", 0.0))
-    headline_volume = int(float(latest.get("headline_volume", 0)))
-    latest_date = str(latest.get("date", ""))
-    bundle = get_bundle()
-    return {
-        "sentiment_index": score,
-        "market_mood": _market_mood(score),
-        "headlines_analyzed": headline_volume,
-        "latest_update": latest_date,
-        "feed_type": "historical_phase4",
-        "model": bundle.config.get("model", "unknown"),
-        "horizon_days": bundle.config.get("horizon_days"),
-        "model_version": bundle.model_version,
-    }
-
-
-@app.get("/dashboard/live-overview", dependencies=[Depends(verify_api_key)])
-def dashboard_live_overview(max_headlines: int = 40):
-    return _load_live_snapshot()
-
-
-@app.get("/dashboard/live-vs-history", dependencies=[Depends(verify_api_key)])
-def dashboard_live_vs_history():
-    snapshot = _load_live_snapshot()
-    windows = snapshot.get("window_summaries", {})
-    return {
-        "live": windows.get("1d"),
-        "recent_7d": windows.get("7d"),
-        "recent_30d": windows.get("30d"),
-        "feed_type": snapshot.get("feed_type"),
-        "source_policy": snapshot.get("source_policy"),
-        "gdelt_error": snapshot.get("gdelt_error"),
-        "timestamp": datetime.now(timezone.utc),
-    }
-
-
-@app.post("/dashboard/live-refresh", dependencies=[Depends(verify_api_key)])
-def dashboard_live_refresh():
-    try:
-        return build_live_snapshot(
-            tokenizer=_tokenizer,
-            model=_sent_model,
-            model_version=get_bundle().model_version,
-            output_path=LIVE_SNAPSHOT_PATH,
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Live news refresh failed: {exc}") from exc
-
-
-@app.get("/dashboard/sentiment-trend", dependencies=[Depends(verify_api_key)])
-def dashboard_sentiment_trend():
-    sentiment_df = _require_csv(SENT_PATH, "daily_sentiment_index.csv").copy()
-    spy_df = _require_csv(SPY_PATH, "spy_stooq.csv").copy()
-
-    sentiment_df["date"] = pd.to_datetime(sentiment_df["date"], errors="coerce")
-    spy_df["Date"] = pd.to_datetime(spy_df["Date"], errors="coerce")
-
-    trend_df = sentiment_df.merge(
-        spy_df[["Date", "Close"]],
-        left_on="date",
-        right_on="Date",
-        how="left",
-    ).drop(columns=["Date"])
-
-    trend_df = trend_df.dropna(subset=["date"]).sort_values("date")
-    trend_df["date"] = trend_df["date"].dt.strftime("%Y-%m-%d")
-
-    trend_df = trend_df[["date", "mean_sentiment", "headline_volume", "Close"]].rename(
-        columns={"Close": "spy_close"}
-    )
-    trend_df = trend_df.astype(object).where(pd.notna(trend_df), None)
-    records = trend_df.to_dict(orient="records")
-    return {"rows": records}
-
-
-@app.get("/dashboard/headline-volume", dependencies=[Depends(verify_api_key)])
-def dashboard_headline_volume():
-    sentiment_df = _require_csv(SENT_PATH, "daily_sentiment_index.csv").copy()
-    sentiment_df["date"] = pd.to_datetime(sentiment_df["date"], errors="coerce")
-    sentiment_df = sentiment_df.dropna(subset=["date"]).sort_values("date")
-    sentiment_df["date"] = sentiment_df["date"].dt.strftime("%Y-%m-%d")
-    return {
-        "rows": sentiment_df[["date", "headline_volume"]].to_dict(orient="records")
-    }
-
+# ---------------------------------------------------------------------------
+# Model summary
+# ---------------------------------------------------------------------------
 
 @app.get("/dashboard/model-summary", dependencies=[Depends(verify_api_key)])
 def dashboard_model_summary():
-    metrics_df = _require_csv(METRICS_PATH, "walkforward_metrics.csv")
+    if not METRICS_PATH.exists():
+        raise HTTPException(status_code=404, detail="walkforward_metrics.csv not found")
+    metrics_df = pd.read_csv(METRICS_PATH)
     bundle = get_bundle()
     config = bundle.config
 
@@ -272,31 +320,33 @@ def dashboard_model_summary():
     if not selected.empty:
         selected = selected.sort_values("test_start")
         for _, row in selected.iterrows():
-            windows.append(
-                {
-                    "test_start": row["test_start"],
-                    "test_end": row["test_end"],
-                    "accuracy": float(row["accuracy"]),
-                    "f1": float(row["f1"]),
-                    "roc_auc": float(row["roc_auc"]),
-                }
-            )
+            windows.append({
+                "test_start": row["test_start"],
+                "test_end": row["test_end"],
+                "accuracy": float(row["accuracy"]),
+                "f1": float(row["f1"]),
+                "roc_auc": float(row["roc_auc"]),
+            })
 
-    avg_auc = float(selected["roc_auc"].mean()) if not selected.empty else None
     return {
         "selected_config": config,
-        "average_roc_auc": avg_auc,
+        "average_roc_auc": float(selected["roc_auc"].mean()) if not selected.empty else None,
         "windows": windows,
         "model_version": bundle.model_version,
     }
+
+
+# ---------------------------------------------------------------------------
+# Request logging middleware
+# ---------------------------------------------------------------------------
 
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     start = perf_counter()
     response = await call_next(request)
-    latency_ms = (perf_counter() - start) * 1000
     print(
         f"[api] {request.method} {request.url.path} "
-        f"status={response.status_code} latency_ms={latency_ms:.2f}"
+        f"status={response.status_code} "
+        f"latency_ms={(perf_counter() - start) * 1000:.2f}"
     )
     return response
