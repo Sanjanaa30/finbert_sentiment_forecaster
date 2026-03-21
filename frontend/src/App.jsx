@@ -45,10 +45,10 @@ function formatSentiment(value) {
 
 function defaultCalibration() {
   return {
-    strong_negative_max: -0.25,
-    slight_negative_max: -0.05,
-    slight_positive_min: 0.05,
-    strong_positive_min: 0.25,
+    strong_negative_max: -0.40,
+    slight_negative_max: -0.15,
+    slight_positive_min: 0.15,
+    strong_positive_min: 0.40,
     source: "default",
   };
 }

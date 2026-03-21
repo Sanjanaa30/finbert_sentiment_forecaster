@@ -391,12 +391,12 @@ def fetch_today_top_headlines(limit: int = 5) -> dict[str, list[dict]]:
 
 
 def _market_mood(score: float) -> str:
-    if score >= 0.25:
+    if score >= 0.40:
         return "Strongly Positive"
-    if score >= 0.05:
+    if score >= 0.15:
         return "Slightly Positive"
-    if score > -0.05:
+    if score > -0.15:
         return "Neutral"
-    if score > -0.25:
+    if score > -0.40:
         return "Slightly Negative"
     return "Strongly Negative"
