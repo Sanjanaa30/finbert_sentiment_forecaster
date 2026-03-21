@@ -27,6 +27,7 @@ from app.security import verify_api_key
 from src.live_news import run_pipeline, get_historical_window_summary, _today_window
 from src.database import (
     init_db,
+    rebuild_daily_sentiment,
     fetch_scored_for_window,
     fetch_daily_sentiment_range,
     fetch_today_top_headlines,
@@ -81,6 +82,9 @@ def _run_pipeline_job() -> None:
 def startup() -> None:
     global _tokenizer, _sent_model, _scheduler
     init_db()
+    repaired = rebuild_daily_sentiment()
+    if repaired:
+        print(f"[startup] Rebuilt daily_sentiment for {repaired} missing days.")
     load_bundle()
     _tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
     _sent_model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR).eval()
@@ -181,9 +185,12 @@ def dashboard_live_overview():
     summary["positive_headlines"] = top["positive"]
     summary["neutral_headlines"] = top["neutral"]
     summary["negative_headlines"] = top["negative"]
+    summary["window_start_local"] = start_utc.astimezone(LOCAL_TZ).isoformat()
+    summary["window_end_local"] = end_utc.astimezone(LOCAL_TZ).isoformat()
     summary["latest_update"] = date.today().isoformat()
     summary["feed_type"] = "live_sqlite"
     summary["coverage"] = "Global market news"
+    summary["timezone"] = "America/New_York"
     return summary
 
 

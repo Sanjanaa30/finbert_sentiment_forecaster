@@ -14,7 +14,6 @@ from urllib.error import URLError
 from urllib.parse import urlencode
 from urllib.request import Request as UrlRequest, urlopen
 
-from src.news_sources.filters import is_relevant, relevance_terms
 
 AV_NEWS_URL = "https://www.alphavantage.co/query"
 AV_TICKERS = "SPY,QQQ,GLD,TLT,DIA"   # broad market ETFs for financial coverage
@@ -68,10 +67,6 @@ def fetch(days: int = 1) -> tuple[list[dict], list[str]]:
         if not title or title in seen_titles:
             continue
 
-        terms = relevance_terms(title)
-        if not terms or not is_relevant(title):
-            continue
-
         seen_titles.add(title)
         published_at = _parse_av_date(item.get("time_published"))
         source = (item.get("source") or "alpha_vantage").lower().replace(" ", "_")
@@ -86,7 +81,6 @@ def fetch(days: int = 1) -> tuple[list[dict], list[str]]:
             "query_bucket": None,
             "language": "en",
             "was_translated": False,
-            "relevance_terms": terms,
         })
 
     records.sort(key=lambda r: r.get("published_at") or "", reverse=True)

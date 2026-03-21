@@ -38,8 +38,25 @@ def get_conn(path: Path = DB_PATH):
         conn.close()
 
 
+def _migrate(conn: sqlite3.Connection) -> None:
+    """Add columns that were introduced after the initial schema."""
+    migrations = [
+        ("daily_sentiment", "top_positive_headline_id", "INTEGER REFERENCES raw_headlines(id)"),
+        ("daily_sentiment", "top_negative_headline_id", "INTEGER REFERENCES raw_headlines(id)"),
+        ("scored_headlines", "relevance_terms", "TEXT"),
+    ]
+    existing: dict[str, set[str]] = {}
+    for table, col, col_def in migrations:
+        if table not in existing:
+            rows = conn.execute(f"PRAGMA table_info({table})").fetchall()
+            existing[table] = {r["name"] for r in rows}
+        if col not in existing[table]:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {col_def}")
+            existing[table].add(col)
+
+
 def init_db(path: Path = DB_PATH) -> None:
-    """Create all tables if they don't exist."""
+    """Create all tables if they don't exist, then apply any pending migrations."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with get_conn(path) as conn:
         conn.executescript("""
@@ -55,7 +72,7 @@ def init_db(path: Path = DB_PATH) -> None:
                 was_translated    INTEGER NOT NULL DEFAULT 0,
                 feed_type         TEXT,
                 query_bucket      TEXT,
-                UNIQUE(headline, published_at)
+                UNIQUE(headline)
             );
 
             CREATE TABLE IF NOT EXISTS scored_headlines (
@@ -88,6 +105,11 @@ def init_db(path: Path = DB_PATH) -> None:
                 updated_at               TEXT    NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS pipeline_state (
+                key   TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+
             CREATE INDEX IF NOT EXISTS idx_raw_published_at
                 ON raw_headlines(published_at);
             CREATE INDEX IF NOT EXISTS idx_raw_feed_type
@@ -97,6 +119,32 @@ def init_db(path: Path = DB_PATH) -> None:
             CREATE INDEX IF NOT EXISTS idx_daily_date
                 ON daily_sentiment(date);
         """)
+        _migrate(conn)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline state
+# ---------------------------------------------------------------------------
+
+def get_last_run_at() -> datetime | None:
+    """Return the last successful pipeline run time, or None if never run."""
+    with get_conn() as conn:
+        row = conn.execute(
+            "SELECT value FROM pipeline_state WHERE key = 'last_run_at'"
+        ).fetchone()
+    if row:
+        return datetime.fromisoformat(row["value"])
+    return None
+
+
+def set_last_run_at(dt: datetime) -> None:
+    """Record the time of a successful pipeline run."""
+    with get_conn() as conn:
+        conn.execute(
+            """INSERT INTO pipeline_state (key, value) VALUES ('last_run_at', ?)
+               ON CONFLICT(key) DO UPDATE SET value = excluded.value""",
+            (dt.isoformat(),),
+        )
 
 
 def insert_raw_headlines(records: list[dict]) -> list[int]:
@@ -121,7 +169,7 @@ def insert_raw_headlines(records: list[dict]) -> list[int]:
                         record.get("original_headline"),
                         record.get("source"),
                         record.get("link"),
-                        record.get("published_at"),
+                        record.get("published_at") or fetched_at,
                         fetched_at,
                         record.get("language"),
                         int(record.get("was_translated", False)),
@@ -251,8 +299,9 @@ def fetch_scored_for_window(start_dt: datetime, end_dt: datetime) -> list[dict]:
                 s.relevance_terms
             FROM scored_headlines s
             JOIN raw_headlines r ON r.id = s.headline_id
-            WHERE r.published_at >= ? AND r.published_at <= ?
-            ORDER BY r.published_at DESC
+            WHERE COALESCE(r.published_at, r.fetched_at) >= ?
+              AND COALESCE(r.published_at, r.fetched_at) <= ?
+            ORDER BY COALESCE(r.published_at, r.fetched_at) DESC
             """,
             (start_dt.isoformat(), end_dt.isoformat()),
         ).fetchall()
@@ -264,14 +313,48 @@ def count_distinct_days(start_dt: datetime, end_dt: datetime) -> int:
     with get_conn() as conn:
         result = conn.execute(
             """
-            SELECT COUNT(DISTINCT DATE(r.published_at)) AS day_count
+            SELECT COUNT(DISTINCT DATE(COALESCE(r.published_at, r.fetched_at))) AS day_count
             FROM scored_headlines s
             JOIN raw_headlines r ON r.id = s.headline_id
-            WHERE r.published_at >= ? AND r.published_at <= ?
+            WHERE COALESCE(r.published_at, r.fetched_at) >= ?
+              AND COALESCE(r.published_at, r.fetched_at) <= ?
             """,
             (start_dt.isoformat(), end_dt.isoformat()),
         ).fetchone()
     return int(result["day_count"]) if result else 0
+
+
+def rebuild_daily_sentiment() -> int:
+    """
+    Rebuild daily_sentiment rows for every day that has scored headlines
+    but is missing a daily_sentiment entry. Returns number of days rebuilt.
+    """
+    with get_conn() as conn:
+        missing_days = conn.execute(
+            """
+            SELECT DISTINCT DATE(COALESCE(r.published_at, r.fetched_at)) AS day
+            FROM scored_headlines s
+            JOIN raw_headlines r ON r.id = s.headline_id
+            WHERE DATE(COALESCE(r.published_at, r.fetched_at)) NOT IN (
+                SELECT date FROM daily_sentiment
+            )
+            ORDER BY day
+            """
+        ).fetchall()
+
+    rebuilt = 0
+    for row in missing_days:
+        day_str = row["day"]
+        if not day_str:
+            continue
+        from datetime import datetime as _dt, timezone as _tz
+        day_start = _dt.fromisoformat(f"{day_str}T00:00:00+00:00")
+        day_end   = _dt.fromisoformat(f"{day_str}T23:59:59+00:00")
+        records = fetch_scored_for_window(day_start, day_end)
+        if records:
+            upsert_daily_sentiment(date.fromisoformat(day_str), records)
+            rebuilt += 1
+    return rebuilt
 
 
 def fetch_daily_sentiment_range(start_date: date, end_date: date) -> list[dict]:

@@ -4,17 +4,15 @@ Live news pipeline — fetch, translate, score, store.
 Flow:
     fetch_all_sources()
         → translate non-English headlines
-        → filter noise
-        → store raw to SQLite
-        → score with FinBERT
-        → store scored to SQLite
+        → store ALL to raw_headlines (before filtering)
+        → filter noise / relevance
+        → score with FinBERT (only relevant headlines)
+        → store scored to scored_headlines
         → aggregate daily_sentiment
         → return summary for API
 """
 from __future__ import annotations
 
-import re
-import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -30,20 +28,17 @@ from src.database import (
     upsert_daily_sentiment,
     fetch_scored_for_window,
     fetch_today_top_headlines,
-    count_distinct_days,
+    get_last_run_at,
+    set_last_run_at,
     _market_mood,
 )
-from src.news_sources import gdelt, yahoo_rss, alpha_vantage
+from src.news_sources import gdelt, yahoo_rss, alpha_vantage, google_rss
 from src.news_sources.filters import is_relevant, relevance_terms
 
 DetectorFactory.seed = 0
 LOCAL_TZ = ZoneInfo("America/New_York")
 WEAK_SCORE_THRESHOLD = 0.03
 
-# Backfill state: prevent concurrent and repeated backfills
-_backfill_lock = threading.Lock()
-_backfill_attempted: dict[int, datetime] = {}   # days → last attempt time
-BACKFILL_COOLDOWN_MINUTES = 30
 
 
 # ---------------------------------------------------------------------------
@@ -91,20 +86,18 @@ def fetch_all_sources(days: int = 1) -> tuple[list[dict], list[str]]:
             seen_titles.add(r["headline"])
             all_records.append(r)
 
-    # 2. Alpha Vantage (skipped silently if no API key)
-    av_records, av_errors = alpha_vantage.fetch(days=days)
-    all_errors.extend(av_errors)
-    for r in av_records:
+    # 2. Google News RSS (no API key, no rate limits)
+    google_records, google_errors = google_rss.fetch()
+    all_errors.extend(google_errors)
+    for r in google_records:
         if r["headline"] not in seen_titles:
             seen_titles.add(r["headline"])
             all_records.append(r)
 
-    # 3. GDELT (free, rate-limited — used as supplementary)
-    end_dt = datetime.now(timezone.utc)
-    start_dt = end_dt - timedelta(days=days)
-    gdelt_records, gdelt_errors = gdelt.fetch(start_dt, end_dt, max_records=80)
-    all_errors.extend(gdelt_errors)
-    for r in gdelt_records:
+    # 3. Alpha Vantage (skipped silently if no API key)
+    av_records, av_errors = alpha_vantage.fetch(days=days)
+    all_errors.extend(av_errors)
+    for r in av_records:
         if r["headline"] not in seen_titles:
             seen_titles.add(r["headline"])
             all_records.append(r)
@@ -116,26 +109,54 @@ def fetch_all_sources(days: int = 1) -> tuple[list[dict], list[str]]:
 # Translate + filter
 # ---------------------------------------------------------------------------
 
-def prepare_records(records: list[dict]) -> list[dict]:
+def _is_recent(published_at: str | None, max_age_days: int = 31) -> bool:
+    """Reject any record with published_at older than max_age_days."""
+    if not published_at:
+        return True  # no date = keep (will use fetched_at as fallback)
+    try:
+        dt = datetime.fromisoformat(published_at)
+        cutoff = datetime.now(timezone.utc) - timedelta(days=max_age_days)
+        return dt >= cutoff
+    except (ValueError, TypeError):
+        return False
+
+
+def translate_records(records: list[dict]) -> list[dict]:
     """
-    Translate non-English headlines, re-filter after translation,
-    attach relevance_terms.
+    Translate non-English headlines. Returns ALL records (no filtering).
+    Rejects any record with published_at before 2026.
+    These go into raw_headlines as-is.
     """
-    prepared = []
+    translated_records = []
     for record in records:
-        translated, was_translated, lang = _translate(record["headline"])
-        terms = relevance_terms(translated)
-        if not terms or not is_relevant(translated):
+        if not _is_recent(record.get("published_at")):
             continue
-        prepared.append({
+        translated, was_translated, lang = _translate(record["headline"])
+        translated_records.append({
             **record,
             "headline": translated,
             "original_headline": record.get("original_headline") or record["headline"],
             "was_translated": was_translated,
             "language": lang,
+        })
+    return translated_records
+
+
+def filter_relevant(records: list[dict]) -> list[dict]:
+    """
+    Filter for financial relevance and attach relevance_terms.
+    Only these go into scored_headlines.
+    """
+    filtered = []
+    for record in records:
+        terms = relevance_terms(record["headline"])
+        if not terms or not is_relevant(record["headline"]):
+            continue
+        filtered.append({
+            **record,
             "relevance_terms": terms,
         })
-    return prepared
+    return filtered
 
 
 # ---------------------------------------------------------------------------
@@ -266,67 +287,6 @@ def _historical_window(days: int) -> tuple[datetime, datetime]:
 # Backfill — fetch historical window from GDELT and store permanently
 # ---------------------------------------------------------------------------
 
-MIN_DAYS_REQUIRED = {7: 1, 30: 1}  # accept any stored data before stopping backfill attempts
-
-
-def _backfill_window(
-    days: int,
-    start_utc: datetime,
-    end_utc: datetime,
-    tokenizer,
-    model,
-) -> None:
-    """
-    Fetch from GDELT for the historical window, score, and store in SQLite.
-    Protected by a lock + cooldown so concurrent requests don't pile up.
-    """
-    now = datetime.now(timezone.utc)
-
-    # Skip if a backfill for this window was attempted recently
-    last = _backfill_attempted.get(days)
-    if last and (now - last).total_seconds() < BACKFILL_COOLDOWN_MINUTES * 60:
-        print(f"[backfill] Skipping {days}d — attempted {int((now - last).total_seconds() / 60)}m ago")
-        return
-
-    # Only one backfill at a time across all windows
-    if not _backfill_lock.acquire(blocking=False):
-        print(f"[backfill] Skipping {days}d — another backfill is already running")
-        return
-
-    try:
-        _backfill_attempted[days] = now
-        print(f"[backfill] Fetching {days}d window from GDELT...")
-        raw_records, errors = gdelt.fetch(start_utc, end_utc, max_records=80)
-        if errors:
-            print(f"[backfill] GDELT errors: {errors}")
-        if not raw_records:
-            print(f"[backfill] No records returned for {days}d window.")
-            return
-
-        prepared = prepare_records(raw_records)
-        raw_ids = insert_raw_headlines(prepared)
-        scored = score_records(prepared, tokenizer, model)
-        insert_scored_headlines(scored, raw_ids)
-
-        from collections import defaultdict
-        from datetime import date as date_type
-        daily_buckets: dict[str, list[tuple[dict, int | None]]] = defaultdict(list)
-        for record, raw_id in zip(scored, raw_ids):
-            pub = record.get("published_at")
-            if pub:
-                try:
-                    day_key = datetime.fromisoformat(pub).astimezone(LOCAL_TZ).date()
-                    daily_buckets[day_key.isoformat()].append((record, raw_id))
-                except ValueError:
-                    pass
-        for day_str, pairs in daily_buckets.items():
-            day_records = [p[0] for p in pairs]
-            day_raw_ids = [p[1] for p in pairs]
-            upsert_daily_sentiment(date_type.fromisoformat(day_str), day_records, day_raw_ids)
-
-        print(f"[backfill] Stored {len(scored)} headlines across {len(daily_buckets)} days.")
-    finally:
-        _backfill_lock.release()
 
 
 def get_historical_window_summary(
@@ -336,21 +296,15 @@ def get_historical_window_summary(
     window_label: str,
 ) -> dict:
     """
-    Hybrid: use SQLite if any data stored, else attempt one GDELT backfill.
-    7D/30D exclude today for stability.
+    Read 7D/30D window from SQLite. Backfill is handled in run_pipeline,
+    not here — so this is always a fast read.
     """
     start_utc, end_utc = _historical_window(days)
-    min_days = MIN_DAYS_REQUIRED.get(days, 1)
-    stored_days = count_distinct_days(start_utc, end_utc)
-
-    if stored_days < min_days:
-        _backfill_window(days, start_utc, end_utc, tokenizer, model)
-
     rows = fetch_scored_for_window(start_utc, end_utc)
     summary = summarize(rows, window_label)
     summary["window_start_local"] = start_utc.astimezone(LOCAL_TZ).isoformat()
     summary["window_end_local"] = end_utc.astimezone(LOCAL_TZ).isoformat()
-    summary["source"] = "SQLite (historical)" if stored_days >= min_days else "SQLite (backfilled from GDELT)"
+    summary["source"] = "SQLite (historical)"
     return summary
 
 
@@ -358,41 +312,145 @@ def get_historical_window_summary(
 # Main pipeline entry point
 # ---------------------------------------------------------------------------
 
+def _store_and_score(records: list[dict], tokenizer, model) -> int:
+    """
+    Translate → store raw → filter → score → store scored.
+    Returns number of scored headlines.
+    """
+    translated = translate_records(records)
+    raw_ids = insert_raw_headlines(translated)
+
+    relevant = filter_relevant(translated)
+    headline_to_raw_id = {}
+    for rec, rid in zip(translated, raw_ids):
+        if rid is not None:
+            headline_to_raw_id[rec["headline"]] = rid
+    relevant_raw_ids = [headline_to_raw_id.get(r["headline"]) for r in relevant]
+
+    scored = score_records(relevant, tokenizer, model)
+    insert_scored_headlines(scored, relevant_raw_ids)
+    return len(scored)
+
+
+def _backfill_date_range(
+    start_utc: datetime,
+    end_utc: datetime,
+    tokenizer,
+    model,
+) -> tuple[int, list[str]]:
+    """
+    Fetch from GDELT for a specific date range, store, and
+    create daily_sentiment rows for each day in that range.
+    Returns (scored_count, errors).
+    """
+    raw_records, errors = gdelt.fetch(start_utc, end_utc, max_records=80)
+    if not raw_records:
+        return 0, errors
+
+    count = _store_and_score(raw_records, tokenizer, model)
+
+    # Create daily_sentiment rows for each day in the range
+    current = start_utc.astimezone(LOCAL_TZ).date()
+    end_date = end_utc.astimezone(LOCAL_TZ).date()
+    while current <= end_date:
+        day_start = datetime.combine(current, datetime.min.time(), tzinfo=LOCAL_TZ).astimezone(timezone.utc)
+        day_end = datetime.combine(current, datetime.max.time(), tzinfo=LOCAL_TZ).astimezone(timezone.utc)
+        day_rows = fetch_scored_for_window(day_start, day_end)
+        if day_rows:
+            upsert_daily_sentiment(current, day_rows)
+        current += timedelta(days=1)
+
+    return count, errors
+
+
 def run_pipeline(tokenizer, model, model_version: str) -> dict:
     """
     Full pipeline:
-    1. Fetch from all sources
-    2. Translate + filter noise
-    3. Store raw to SQLite
-    4. Score with FinBERT
-    5. Store scored to SQLite
-    6. Aggregate daily_sentiment
-    7. Return summary for today
+
+    First run (no last_run_at):
+        1. Fetch today from Yahoo RSS + Google RSS
+        2. Backfill last 7 days from GDELT (yesterday → 7 days ago)
+        3. Backfill rest of month from GDELT (8 days ago → 1st of month)
+
+    Subsequent runs:
+        1. Fetch today from Yahoo RSS + Google RSS
+        2. If gap > 1 day since last run, backfill gap from GDELT
+        3. Update last_run_at
     """
     init_db()
 
+    now_utc = datetime.now(timezone.utc)
     now_local = datetime.now(LOCAL_TZ)
     today = now_local.date()
+    all_errors: list[str] = []
 
-    # --- Fetch ---
+    last_run = get_last_run_at()
+
+    # --- Step 1: Fetch today from RSS sources ---
     raw_records, errors = fetch_all_sources(days=1)
+    all_errors.extend(errors)
+    today_scored = _store_and_score(raw_records, tokenizer, model)
+    sources_used = list({r.get("feed_type") for r in raw_records if r.get("feed_type")})
 
-    # --- Translate + filter ---
-    prepared = prepare_records(raw_records)
+    if last_run is None:
+        # --- First run: backfill the current month ---
+        print("[pipeline] First run detected — backfilling current month from GDELT")
 
-    # --- Store raw ---
-    raw_ids = insert_raw_headlines(prepared)
+        # 7D window: yesterday → 7 days ago
+        seven_days_ago = datetime.combine(
+            (now_local - timedelta(days=7)).date(), datetime.min.time(), tzinfo=LOCAL_TZ
+        ).astimezone(timezone.utc)
+        yesterday_end = datetime.combine(
+            (now_local - timedelta(days=1)).date(), datetime.max.time(), tzinfo=LOCAL_TZ
+        ).astimezone(timezone.utc)
+        count_7d, errs_7d = _backfill_date_range(seven_days_ago, yesterday_end, tokenizer, model)
+        all_errors.extend(errs_7d)
+        print(f"[pipeline] 7D backfill: {count_7d} headlines scored")
 
-    # --- Score ---
-    scored = score_records(prepared, tokenizer, model)
+        import time
+        time.sleep(5)  # avoid GDELT rate limit between backfill calls
 
-    # --- Store scored ---
-    insert_scored_headlines(scored, raw_ids)
+        # 30D window: 1st of month → 8 days ago
+        first_of_month = datetime.combine(
+            now_local.date().replace(day=1), datetime.min.time(), tzinfo=LOCAL_TZ
+        ).astimezone(timezone.utc)
+        eight_days_ago_end = datetime.combine(
+            (now_local - timedelta(days=8)).date(), datetime.max.time(), tzinfo=LOCAL_TZ
+        ).astimezone(timezone.utc)
+        if first_of_month < eight_days_ago_end:
+            count_30d, errs_30d = _backfill_date_range(first_of_month, eight_days_ago_end, tokenizer, model)
+            all_errors.extend(errs_30d)
+            print(f"[pipeline] 30D backfill: {count_30d} headlines scored")
 
-    # --- Aggregate today ---
-    upsert_daily_sentiment(today, scored, raw_ids)
+        if sources_used and "gdelt" not in sources_used:
+            sources_used.append("gdelt")
 
-    # --- 1D: today midnight → now ---
+    else:
+        # --- Subsequent run: check for gaps ---
+        gap_hours = (now_utc - last_run).total_seconds() / 3600
+        if gap_hours > 24:
+            # Fill the gap from GDELT
+            gap_start = last_run
+            gap_end = datetime.combine(
+                (now_local - timedelta(days=1)).date(), datetime.max.time(), tzinfo=LOCAL_TZ
+            ).astimezone(timezone.utc)
+            if gap_start < gap_end:
+                gap_days = int((gap_end - gap_start).total_seconds() / 86400) + 1
+                print(f"[pipeline] Gap detected: {gap_days} days since last run — backfilling from GDELT")
+                count_gap, errs_gap = _backfill_date_range(gap_start, gap_end, tokenizer, model)
+                all_errors.extend(errs_gap)
+                print(f"[pipeline] Gap backfill: {count_gap} headlines scored")
+
+    # --- Aggregate today's daily_sentiment ---
+    start_today, end_today = _today_window()
+    all_today = fetch_scored_for_window(start_today, end_today)
+    if all_today:
+        upsert_daily_sentiment(today, all_today)
+
+    # --- Update last_run_at ---
+    set_last_run_at(now_utc)
+
+    # --- Build summaries ---
     start_1d, end_1d = _today_window()
     today_records = fetch_scored_for_window(start_1d, end_1d)
     today_summary = summarize(today_records, "1d")
@@ -400,7 +458,6 @@ def run_pipeline(tokenizer, model, model_version: str) -> dict:
     today_summary["window_end_local"] = end_1d.astimezone(LOCAL_TZ).isoformat()
     today_summary["source"] = "Live (SQLite today)"
 
-    # --- 7D/30D: hybrid (SQLite if enough data, else GDELT backfill) ---
     window_summaries = {"1d": today_summary}
     for days, key in [(7, "7d"), (30, "30d")]:
         window_summaries[key] = get_historical_window_summary(
@@ -410,8 +467,8 @@ def run_pipeline(tokenizer, model, model_version: str) -> dict:
     return {
         "latest_update": today.isoformat(),
         "model_version": model_version,
-        "source_errors": errors,
-        "sources_used": list({r.get("feed_type") for r in prepared if r.get("feed_type")}),
+        "source_errors": all_errors,
+        "sources_used": sources_used,
         "window_summaries": window_summaries,
         **today_summary,
     }
