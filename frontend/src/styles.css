@@ -615,3 +615,110 @@ body {
     text-align: left;
   }
 }
+
+/* Signal check cards */
+.signal-check-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 16px;
+  margin-bottom: 24px;
+}
+
+.signal-card {
+  background: #f8f9fc;
+  border-radius: 12px;
+  padding: 20px;
+  text-align: center;
+  border: 1px solid #e2e6ed;
+}
+
+.signal-card.positive {
+  border-left: 4px solid #2e8b3d;
+}
+
+.signal-card.negative {
+  border-left: 4px solid #dc3545;
+}
+
+.signal-value {
+  font-size: 2.2rem;
+  font-weight: 800;
+  color: #1f2638;
+  line-height: 1.1;
+}
+
+.signal-label {
+  font-size: 0.85rem;
+  font-weight: 700;
+  color: #4a5068;
+  margin-top: 6px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+.signal-detail {
+  font-size: 0.78rem;
+  color: #7f8795;
+  margin-top: 6px;
+  line-height: 1.4;
+}
+
+/* Stacked charts */
+.stacked-charts {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.chart-section {
+  position: relative;
+}
+
+.chart-label {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #667086;
+  padding: 8px 0 4px 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+}
+
+/* Forecast probability bar */
+.forecast-probability-bar {
+  margin: 12px 0;
+}
+
+.prob-label {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.7);
+  margin-bottom: 4px;
+}
+
+.prob-track {
+  display: flex;
+  height: 8px;
+  border-radius: 4px;
+  overflow: hidden;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+.prob-fill.down {
+  background: #dc3545;
+}
+
+.prob-fill.up {
+  background: #2e8b3d;
+}
+
+.forecast-badge.down {
+  color: #dc3545;
+}
+
+@media (max-width: 768px) {
+  .signal-check-grid {
+    grid-template-columns: 1fr;
+  }
+}

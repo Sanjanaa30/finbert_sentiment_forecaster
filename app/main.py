@@ -35,6 +35,8 @@ from src.database import (
 )
 from zoneinfo import ZoneInfo
 
+import numpy as np
+
 ROOT = Path(__file__).resolve().parents[1]
 METRICS_PATH = ROOT / "artifacts" / "walkforward_metrics.csv"
 MODEL_DIR = ROOT / "models" / "finbert_sentiment"
@@ -217,7 +219,7 @@ def dashboard_live_vs_history():
         "recent_7d": recent_7d,
         "recent_30d": recent_30d,
         "source_policy": {
-            "primary_source": "Yahoo Finance RSS + Alpha Vantage + GDELT",
+            "primary_source": "Yahoo RSS + Google RSS + MarketWatch + CNBC + Alpha Vantage + GDELT",
             "gdelt_status": "supplementary",
         },
         "timestamp": datetime.now(timezone.utc),
@@ -233,7 +235,74 @@ def dashboard_live_sentiment_trend(days: int = 30):
     end = date.today()
     start = end - timedelta(days=days)
     rows = fetch_daily_sentiment_range(start, end)
-    return {"rows": rows}
+
+    # Fetch SPY prices for the same window
+    spy_map = {}
+    try:
+        import yfinance as yf
+        spy = yf.download(
+            "SPY",
+            start=start.isoformat(),
+            end=(end + timedelta(days=1)).isoformat(),
+            progress=False,
+        )
+        for idx, row in spy.iterrows():
+            day_str = idx.strftime("%Y-%m-%d")
+            close_val = row[("Close", "SPY")] if ("Close", "SPY") in row.index else row.get("Close")
+            if close_val is not None:
+                spy_map[day_str] = round(float(close_val), 2)
+    except Exception:
+        pass
+
+    # Compute SPY daily change and signal accuracy
+    sorted_dates = sorted(spy_map.keys())
+    spy_change_map = {}
+    for i in range(1, len(sorted_dates)):
+        prev_close = spy_map[sorted_dates[i - 1]]
+        curr_close = spy_map[sorted_dates[i]]
+        spy_change_map[sorted_dates[i]] = round(((curr_close - prev_close) / prev_close) * 100, 2)
+
+    for r in rows:
+        r["spy_close"] = spy_map.get(r["date"])
+        r["spy_change_pct"] = spy_change_map.get(r["date"])
+
+    # Signal check: did sentiment direction match next-day market direction?
+    correct = 0
+    total = 0
+    positive_days_up = 0
+    positive_days_total = 0
+    negative_days_down = 0
+    negative_days_total = 0
+    for r in rows:
+        sentiment = r.get("mean_sentiment")
+        spy_change = r.get("spy_change_pct")
+        if sentiment is None or spy_change is None:
+            continue
+        total += 1
+        sentiment_positive = sentiment > 0
+        market_up = spy_change > 0
+        if sentiment_positive == market_up:
+            correct += 1
+        if sentiment > 0:
+            positive_days_total += 1
+            if market_up:
+                positive_days_up += 1
+        elif sentiment < 0:
+            negative_days_total += 1
+            if not market_up:
+                negative_days_down += 1
+
+    signal_check = {
+        "total_days": total,
+        "correct_days": correct,
+        "accuracy_pct": round((correct / total) * 100) if total else None,
+        "positive_sentiment_days": positive_days_total,
+        "positive_sentiment_market_up": positive_days_up,
+        "negative_sentiment_days": negative_days_total,
+        "negative_sentiment_market_down": negative_days_down,
+    }
+
+    return {"rows": rows, "signal_check": signal_check}
 
 
 # ---------------------------------------------------------------------------
@@ -339,6 +408,102 @@ def dashboard_model_summary():
         "selected_config": config,
         "average_roc_auc": float(selected["roc_auc"].mean()) if not selected.empty else None,
         "windows": windows,
+        "model_version": bundle.model_version,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Live Market Forecast — real prediction from final_model.pkl
+# ---------------------------------------------------------------------------
+
+@app.get("/dashboard/live-forecast", dependencies=[Depends(verify_api_key)])
+def dashboard_live_forecast():
+    """
+    Compute a live 20-day market direction forecast using today's SPY data
+    and the trained logistic regression model.
+    """
+    bundle = get_bundle()
+    features = bundle.features  # ['ret_1d', 'ret_5d', ..., 'ma5_minus_ma20']
+
+    # Fetch ~60 days of SPY prices (need 20+ days for rolling features)
+    try:
+        import yfinance as yf
+        spy = yf.download("SPY", period="3mo", progress=False)
+        if spy.empty:
+            raise ValueError("No SPY data returned")
+        # Flatten multi-level columns if present
+        if hasattr(spy.columns, "levels"):
+            spy.columns = [c[0] if isinstance(c, tuple) else c for c in spy.columns]
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Failed to fetch SPY data: {exc}") from exc
+
+    close = spy["Close"]
+
+    # Compute features
+    ret_1d = close.pct_change(1)
+    ret_5d = close.pct_change(5)
+    ret_10d = close.pct_change(10)
+    ret_20d = close.pct_change(20)
+
+    vol_5d = ret_1d.rolling(5).std()
+    vol_10d = ret_1d.rolling(10).std()
+    vol_20d = ret_1d.rolling(20).std()
+
+    ma_5 = close.rolling(5).mean()
+    ma_10 = close.rolling(10).mean()
+    ma_20 = close.rolling(20).mean()
+
+    ma_5_gap = (close / ma_5) - 1.0
+    ma_10_gap = (close / ma_10) - 1.0
+    close_to_ma20 = (close / ma_20) - 1.0
+    ma5_minus_ma20 = (ma_5 / ma_20) - 1.0
+
+    feature_df = pd.DataFrame({
+        "ret_1d": ret_1d,
+        "ret_5d": ret_5d,
+        "ret_10d": ret_10d,
+        "ret_20d": ret_20d,
+        "vol_5d": vol_5d,
+        "vol_10d": vol_10d,
+        "vol_20d": vol_20d,
+        "ma_5_gap": ma_5_gap,
+        "ma_10_gap": ma_10_gap,
+        "close_to_ma20": close_to_ma20,
+        "ma5_minus_ma20": ma5_minus_ma20,
+    })
+
+    # Use the latest row (today or last trading day)
+    latest = feature_df.dropna().iloc[[-1]]
+    if latest.empty:
+        raise HTTPException(status_code=500, detail="Not enough price data to compute features")
+
+    latest_date = latest.index[0].strftime("%Y-%m-%d")
+    latest_close = round(float(close.iloc[-1]), 2)
+
+    # Ensure column order matches model training
+    X = latest[features]
+
+    # Predict
+    prediction = int(bundle.model.predict(X)[0])  # 0=down, 1=up
+    probabilities = bundle.model.predict_proba(X)[0]
+    prob_down = round(float(probabilities[0]) * 100, 1)
+    prob_up = round(float(probabilities[1]) * 100, 1)
+
+    horizon = bundle.config.get("horizon_days", 20)
+
+    # Feature values for transparency
+    feature_values = {col: round(float(X[col].iloc[0]), 6) for col in features}
+
+    return {
+        "prediction": "UP" if prediction == 1 else "DOWN",
+        "confidence_pct": prob_up if prediction == 1 else prob_down,
+        "prob_up_pct": prob_up,
+        "prob_down_pct": prob_down,
+        "horizon_days": horizon,
+        "model_type": bundle.config.get("model", "logreg"),
+        "based_on_date": latest_date,
+        "spy_close": latest_close,
+        "feature_values": feature_values,
         "model_version": bundle.model_version,
     }
 

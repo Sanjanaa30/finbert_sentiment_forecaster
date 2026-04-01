@@ -32,7 +32,7 @@ from src.database import (
     set_last_run_at,
     _market_mood,
 )
-from src.news_sources import gdelt, yahoo_rss, alpha_vantage, google_rss
+from src.news_sources import gdelt, yahoo_rss, alpha_vantage, google_rss, marketwatch_rss
 from src.news_sources.filters import is_relevant, relevance_terms
 
 DetectorFactory.seed = 0
@@ -94,10 +94,32 @@ def fetch_all_sources(days: int = 1) -> tuple[list[dict], list[str]]:
             seen_titles.add(r["headline"])
             all_records.append(r)
 
-    # 3. Alpha Vantage (skipped silently if no API key)
+    # 3. MarketWatch / CNBC / Reuters / Investing.com RSS
+    mw_records, mw_errors = marketwatch_rss.fetch()
+    all_errors.extend(mw_errors)
+    for r in mw_records:
+        if r["headline"] not in seen_titles:
+            seen_titles.add(r["headline"])
+            all_records.append(r)
+
+    # 4. Alpha Vantage (skipped silently if no API key)
     av_records, av_errors = alpha_vantage.fetch(days=days)
     all_errors.extend(av_errors)
     for r in av_records:
+        if r["headline"] not in seen_titles:
+            seen_titles.add(r["headline"])
+            all_records.append(r)
+
+    # 5. GDELT live (today's window)
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+    _et = _ZI("America/New_York")
+    _now = _dt.now(_et)
+    _start = _dt.combine(_now.date(), _dt.min.time(), tzinfo=_et).astimezone(timezone.utc)
+    _end = _now.astimezone(timezone.utc)
+    gdelt_records, gdelt_errors = gdelt.fetch(_start, _end, max_records=100)
+    all_errors.extend(gdelt_errors)
+    for r in gdelt_records:
         if r["headline"] not in seen_titles:
             seen_titles.add(r["headline"])
             all_records.append(r)

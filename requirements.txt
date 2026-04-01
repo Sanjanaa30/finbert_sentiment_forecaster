@@ -12,3 +12,4 @@ python-dotenv
 langdetect
 deep-translator
 apscheduler
+yfinance

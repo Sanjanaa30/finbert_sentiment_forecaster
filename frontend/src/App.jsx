@@ -4,8 +4,8 @@ import {
   AreaChart,
   Bar,
   CartesianGrid,
+  ComposedChart,
   Line,
-  LineChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
@@ -127,11 +127,13 @@ function windowLabel(windowKey) {
 export default function App() {
   const [overview, setOverview] = useState(null);
   const [trendRows, setTrendRows] = useState([]);
+  const [signalCheck, setSignalCheck] = useState(null);
   const [volumeRows, setVolumeRows] = useState([]);
   const [modelSummary, setModelSummary] = useState(null);
   const [feedLabel, setFeedLabel] = useState("historical");
   const [liveComparison, setLiveComparison] = useState(null);
   const [liveComparisonError, setLiveComparisonError] = useState("");
+  const [forecast, setForecast] = useState(null);
   const [headline, setHeadline] = useState("Nvidia raises revenue guidance on strong AI demand");
   const [headlineResult, setHeadlineResult] = useState(null);
   const [headlineError, setHeadlineError] = useState("");
@@ -144,7 +146,7 @@ export default function App() {
 
     async function loadDashboard() {
       try {
-        const [liveOverviewData, trendData, volumeData, summaryData, liveComparisonData] = await Promise.all([
+        const [liveOverviewData, trendData, volumeData, summaryData, liveComparisonData, forecastData] = await Promise.all([
           fetchJson("/dashboard/live-overview?max_headlines=40").catch(() => null),
           fetchJson("/dashboard/live-sentiment-trend").catch(() => ({ rows: [] })),
           fetchJson("/dashboard/headline-volume").catch(() => ({ rows: [] })),
@@ -153,14 +155,17 @@ export default function App() {
             setLiveComparisonError(String(err.message || err));
             return null;
           }),
+          fetchJson("/dashboard/live-forecast").catch(() => null),
         ]);
 
         if (!active) return;
         setOverview(liveOverviewData);
         setFeedLabel(liveOverviewData?.feed_type || "live_sqlite");
         setTrendRows(trendData.rows || []);
+        setSignalCheck(trendData.signal_check || null);
         setVolumeRows(volumeData.rows || []);
         setModelSummary(summaryData);
+        setForecast(forecastData);
         setLiveComparison(liveComparisonData);
       } catch (err) {
         if (!active) return;
@@ -189,16 +194,6 @@ export default function App() {
       setLoadingScore(false);
     }
   }
-
-  const latestWindow = useMemo(() => {
-    if (!modelSummary?.windows?.length) return null;
-    return modelSummary.windows[modelSummary.windows.length - 1];
-  }, [modelSummary]);
-
-  const forecastProbability = useMemo(() => {
-    if (!latestWindow) return null;
-    return Math.round((latestWindow.roc_auc || 0) * 100);
-  }, [latestWindow]);
 
   const trendData = useMemo(
     () =>
@@ -417,54 +412,135 @@ export default function App() {
           <div className="card-title light">Market Forecast</div>
           <div className="forecast-row">
             Prediction:
-            <span className="forecast-badge">UP</span>
+            <span className={`forecast-badge ${forecast?.prediction === "DOWN" ? "down" : ""}`}>
+              {forecast?.prediction || "--"}
+            </span>
           </div>
           <div className="forecast-row">
             Confidence:
-            <strong>{forecastProbability ? `${forecastProbability}%` : "--"}</strong>
+            <strong>{forecast?.confidence_pct ? `${forecast.confidence_pct}%` : "--"}</strong>
+          </div>
+          <div className="forecast-probability-bar">
+            <div className="prob-label">
+              <span>DOWN {forecast?.prob_down_pct ?? "--"}%</span>
+              <span>UP {forecast?.prob_up_pct ?? "--"}%</span>
+            </div>
+            <div className="prob-track">
+              <div
+                className="prob-fill down"
+                style={{ width: `${forecast?.prob_down_pct ?? 50}%` }}
+              />
+              <div
+                className="prob-fill up"
+                style={{ width: `${forecast?.prob_up_pct ?? 50}%` }}
+              />
+            </div>
           </div>
           <div className="forecast-row">
             Model:
-            <strong>{modelSummary?.selected_config?.model || "logreg"}</strong>
+            <strong>{forecast?.model_type || modelSummary?.selected_config?.model || "logreg"}</strong>
           </div>
           <div className="metric-foot light">
-            Horizon: {modelSummary?.selected_config?.horizon_days || 20} trading days
+            Horizon: {forecast?.horizon_days || 20} trading days
+          </div>
+          <div className="metric-foot light">
+            Based on SPY ${forecast?.spy_close || "--"} ({forecast?.based_on_date || "--"})
           </div>
         </article>
       </section>
 
       <section className="panel wide">
-        <div className="panel-heading">Sentiment &amp; SPY Trend</div>
+        <div className="panel-heading">Does News Sentiment Predict the Market?</div>
         <div className="panel-caption">
-          Mean sentiment, SPY close, and headline volume aligned on the same timeline.
+          Compare daily news mood (top) with actual SPY market movement (bottom). When both charts move in the same direction, sentiment is tracking the market.
         </div>
-        <div className="chart-wrap">
-          <ResponsiveContainer width="100%" height={420}>
-            <LineChart data={trendData} margin={{ top: 10, right: 28, left: 10, bottom: 0 }}>
-              <CartesianGrid strokeDasharray="3 3" stroke="rgba(120,132,155,0.2)" />
-              <XAxis dataKey="shortDate" minTickGap={28} stroke="#667086" />
-              <YAxis yAxisId="sentiment" stroke="#3b8d43" domain={["auto", "auto"]} />
-              <YAxis yAxisId="spy" orientation="right" stroke="#7f8795" domain={["auto", "auto"]} />
-              <Tooltip />
-              <Bar yAxisId="sentiment" dataKey="headline_volume" fill="rgba(173,179,190,0.55)" />
-              <Line
-                yAxisId="sentiment"
-                type="monotone"
-                dataKey="mean_sentiment"
-                stroke="#2e8b3d"
-                strokeWidth={3}
-                dot={false}
-              />
-              <Line
-                yAxisId="spy"
-                type="monotone"
-                dataKey="spy_close"
-                stroke="#8d949f"
-                strokeWidth={3}
-                dot={false}
-              />
-            </LineChart>
-          </ResponsiveContainer>
+
+        {signalCheck && signalCheck.total_days > 0 ? (
+          <div className="signal-check-grid">
+            <div className="signal-card">
+              <div className="signal-value">{signalCheck.accuracy_pct}%</div>
+              <div className="signal-label">Overall Match</div>
+              <div className="signal-detail">
+                Sentiment direction matched market direction on {signalCheck.correct_days} of {signalCheck.total_days} days
+              </div>
+            </div>
+            <div className="signal-card positive">
+              <div className="signal-value">
+                {signalCheck.positive_sentiment_days > 0
+                  ? `${signalCheck.positive_sentiment_market_up}/${signalCheck.positive_sentiment_days}`
+                  : "--"}
+              </div>
+              <div className="signal-label">Positive Sentiment → Market Up</div>
+              <div className="signal-detail">
+                Days when news was positive and market actually went up
+              </div>
+            </div>
+            <div className="signal-card negative">
+              <div className="signal-value">
+                {signalCheck.negative_sentiment_days > 0
+                  ? `${signalCheck.negative_sentiment_market_down}/${signalCheck.negative_sentiment_days}`
+                  : "--"}
+              </div>
+              <div className="signal-label">Negative Sentiment → Market Down</div>
+              <div className="signal-detail">
+                Days when news was negative and market actually went down
+              </div>
+            </div>
+          </div>
+        ) : null}
+
+        <div className="stacked-charts">
+          <div className="chart-section">
+            <div className="chart-label">News Sentiment (green) &amp; Headline Volume (grey bars)</div>
+            <ResponsiveContainer width="100%" height={220}>
+              <ComposedChart data={trendData} margin={{ top: 10, right: 28, left: 10, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(120,132,155,0.2)" />
+                <XAxis dataKey="shortDate" minTickGap={28} stroke="#667086" />
+                <YAxis yAxisId="sentiment" stroke="#3b8d43" domain={[-0.5, 0.5]} />
+                <YAxis yAxisId="volume" orientation="right" stroke="#adb3be" domain={[0, "auto"]} />
+                <Tooltip
+                  formatter={(value, name) => {
+                    if (name === "mean_sentiment") return [typeof value === "number" ? value.toFixed(3) : value, "Sentiment"];
+                    if (name === "headline_volume") return [value, "Headlines"];
+                    return [value, name];
+                  }}
+                />
+                <Bar yAxisId="volume" dataKey="headline_volume" fill="rgba(173,179,190,0.45)" barSize={14} />
+                <Area yAxisId="sentiment" type="monotone" dataKey="mean_sentiment" stroke="#2e8b3d" strokeWidth={2} fill="rgba(46,139,61,0.12)" />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
+
+          <div className="chart-section">
+            <div className="chart-label">SPY Price &amp; Daily Change</div>
+            <ResponsiveContainer width="100%" height={220}>
+              <ComposedChart data={trendData} margin={{ top: 10, right: 28, left: 10, bottom: 0 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="rgba(120,132,155,0.2)" />
+                <XAxis dataKey="shortDate" minTickGap={28} stroke="#667086" />
+                <YAxis yAxisId="spy" stroke="#5b7bb4" domain={["auto", "auto"]} />
+                <YAxis yAxisId="change" orientation="right" stroke="#adb3be" domain={["auto", "auto"]} unit="%" />
+                <Tooltip
+                  formatter={(value, name) => {
+                    if (name === "spy_close") return [value ? `$${value}` : "--", "SPY Close"];
+                    if (name === "spy_change_pct") return [value != null ? `${value}%` : "--", "Daily Change"];
+                    return [value, name];
+                  }}
+                />
+                <Bar
+                  yAxisId="change"
+                  dataKey="spy_change_pct"
+                  barSize={14}
+                  fill="#adb3be"
+                  shape={(props) => {
+                    const { x, y, width, height, value } = props;
+                    const color = value >= 0 ? "rgba(46,139,61,0.5)" : "rgba(220,53,69,0.5)";
+                    return <rect x={x} y={y} width={width} height={Math.abs(height)} fill={color} />;
+                  }}
+                />
+                <Line yAxisId="spy" type="monotone" dataKey="spy_close" stroke="#5b7bb4" strokeWidth={3} dot={false} />
+              </ComposedChart>
+            </ResponsiveContainer>
+          </div>
         </div>
       </section>
 
